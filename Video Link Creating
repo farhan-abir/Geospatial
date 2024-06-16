@@ -1,0 +1,39 @@
+// Load the Landsat 8 surface reflectance image collection.
+var collection = ee.ImageCollection('LANDSAT/LC08/C01/T1_SR')
+    .filterDate('2018-01-01', '2018-12-31')
+    .filterBounds(ee.Geometry.Point([-122.292, 37.901]));
+
+// Function to add a date overlay to each image.
+var addDate = function(image) {
+  var date = ee.Date(image.get('system:time_start')).format('YYYY-MM-dd');
+  
+  // Create an image with the text label.
+  var text = ee.Image().paint({
+    featureCollection: ee.FeatureCollection([
+      ee.Feature(null, {label: date})
+    ]),
+    color: 'ffffff',
+    width: 1
+  });
+
+  // Visualize the image.
+  var annotated = image.visualize({bands: ['B4', 'B3', 'B2'], max: 3000});
+  
+  // Blend the text with the visualized image.
+  return annotated.blend(text);
+};
+
+// Apply the function to the image collection.
+var annotatedCollection = collection.map(addDate);
+
+// Set up parameters for the video.
+var videoArgs = {
+  dimensions: 720,
+  region: ee.Geometry.Point([-122.292, 37.901]).buffer(1e4).bounds(),
+  framesPerSecond: 2,
+  format: 'gif'
+};
+
+// Get the video URL and print it.
+var video = annotatedCollection.getVideoThumbURL(videoArgs);
+print(video);
