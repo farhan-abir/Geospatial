@@ -1,0 +1,782 @@
+
+// Input filtering criteria for cloud 
+var Cloud = 10;
+
+// function for scaling
+function scaling (image) {
+ // Scale and offset values for optical bands
+ var opticalBands = image.select(['SR_B.*']).multiply(0.0000275).add(-0.2);
+ 
+ // Scale and offset values for thermal bands
+ var thermalBands = image.select(['ST_B.*']).multiply(0.00341802).add(149.0);
+ 
+ // Add scaled bands to the original image
+ return image.addBands(opticalBands, null, true)
+            .addBands(thermalBands, null, true);
+}
+
+// Function to Mask Clouds and Cloud Shadows in Landsat 8 Imagery
+function cloudMask(image) {
+  // Define cloud shadow and cloud bitmasks (Bits 3 and 5)
+  var cloudShadowBitmask = (1 << 3);
+  var cloudBitmask = (1 << 5);
+
+  // Select the Quality Assessment (QA) band for pixel quality information
+  var qa = image.select('QA_PIXEL');
+
+  // Create a binary mask to identify clear conditions (both cloud and cloud shadow bits set to 0)
+  var mask = qa.bitwiseAnd(cloudShadowBitmask).eq(0)
+                .and(qa.bitwiseAnd(cloudBitmask).eq(0));
+
+  // Update the original image, masking out cloud and cloud shadow-affected pixels
+  return image.updateMask(mask);
+}
+
+
+// Function to calculate LST for each image
+function TM (image) {
+    var ndvi = image.normalizedDifference(['SR_B4', 'SR_B3']).rename('NDVI');
+ 
+ //selecting thermal band ST_B6
+ var thermal= image.select('ST_B6');
+ 
+ // find the min and max of NDVI
+ {
+ var min = ee.Number(ndvi.reduceRegion({
+ reducer: ee.Reducer.min(),
+ geometry: ROI,
+ scale: 30,
+ maxPixels: 1e13
+ }).values().get(0));
+ 
+ var max = ee.Number(ndvi.reduceRegion({
+ reducer: ee.Reducer.max(),
+ geometry: ROI,
+ scale: 30,
+ maxPixels: 1e13
+ }).values().get(0));
+ }
+ 
+ //fractional vegetation
+ 
+ var fv =(ndvi.subtract(min).divide(max.subtract(min))).pow(ee.Number(2)).rename('FV'); 
+ 
+ 
+ //Emissivity
+ 
+ var a= ee.Number(0.004);
+ var b= ee.Number(0.986);
+ var EM=fv.multiply(a).add(b).rename('EMM');
+ 
+ //LST in Celsius Degree bring -273.15
+ //NB: In Kelvin don't bring -273.15
+ var LST = thermal.expression(
+ '(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))-273.15', {
+  'Tb': thermal.select('ST_B6'),
+ 'Ep': EM.select('EMM')
+ }).rename('LST');
+ 
+ return LST
+ 
+    }
+
+
+// Function to calculate LST for each image
+function OLI (image) {
+    var ndvi = image.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+ 
+ //selecting thermal band ST_B10
+ var thermal= image.select('ST_B10');
+ 
+ // find the min and max of NDVI
+ {
+ var min = ee.Number(ndvi.reduceRegion({
+ reducer: ee.Reducer.min(),
+ geometry: ROI,
+ scale: 30,
+ maxPixels: 1e13
+ }).values().get(0));
+ 
+ var max = ee.Number(ndvi.reduceRegion({
+ reducer: ee.Reducer.max(),
+ geometry: ROI,
+ scale: 30,
+ maxPixels: 1e13
+ }).values().get(0));
+ }
+ 
+ //fractional vegetation
+ 
+ var fv =(ndvi.subtract(min).divide(max.subtract(min))).pow(ee.Number(2)).rename('FV'); 
+ 
+ 
+ //Emissivity
+ 
+ var a= ee.Number(0.004);
+ var b= ee.Number(0.986);
+ var EM=fv.multiply(a).add(b).rename('EMM');
+ 
+ //LST in Celsius Degree bring -273.15
+ //NB: In Kelvin don't bring -273.15
+ var LST = thermal.expression(
+ '(Tb/(1 + (0.00115* (Tb / 1.438))*log(Ep)))-273.15', {
+  'Tb': thermal.select('ST_B10'),
+ 'Ep': EM.select('EMM')
+ }).rename('LST');
+ 
+ return LST
+ 
+    }
+
+    function LST(imageCollection, roi, func) {
+        // Calculate LST for each image
+        var LSTCollection = imageCollection.map(func);
+        
+        // Calculate the median of the LST collection
+        var medianLST = LSTCollection.median();
+        
+      
+        // Clip the median LST to the ROI
+        return medianLST.clip(roi)
+      }
+   
+
+      function UTFVI (image, roi, VisName) {
+        // Calculate mean LST for each image
+        var mean = ee.Number(image.reduceRegion({reducer: ee.Reducer.mean(),geometry: roi ,scale: 30,maxPixels: 1e13}).get('LST'));
+        
+        // Calculate utfvi for each image
+        var cal = (image.subtract(mean)).divide(image);
+        
+        // Rename the dataset
+        var eco = cal.rename('UTFVI');
+        
+        // Classify image according to standards
+        var classify = eco.expression(
+       "(b('UTFVI')   < 0) ? 1" +
+       ": (b('UTFVI') < 0.005) ? 2" +
+       ": (b('UTFVI') < 0.010) ? 3" +
+       ": (b('UTFVI') < 0.015) ? 4" +
+       ": (b('UTFVI') < 0.020) ? 5" +
+       ": 6"
+     );
+     
+     // Clip the median LST to the ROI
+     var final = classify.clip(roi);
+     
+     // Visualize parameters
+     var view = Map.addLayer(final, {min: 1, max: 6, palette: ['darkgreen', 'green', 'yellow', 'orange', 'red', 'darkred']}, VisName);
+      
+        
+        return final;
+      }
+
+
+      function Island(image, roi) {
+        // Calculate mean LST for each image
+        var mean = ee.Number(image.reduceRegion({reducer: ee.Reducer.mean(),geometry: roi ,scale: 30,maxPixels: 1e13}).get('LST'));
+        // Calculate standard deviation LST for each image
+        var std = ee.Number(image.reduceRegion({reducer: ee.Reducer.stdDev(),geometry: roi ,scale: 30,maxPixels: 1e13}).get('LST'));
+        
+        var cutmark = mean.add(std.multiply(2));
+        
+        var cls = image.expression(
+     'b("LST") < threshold ? 1 : 2', // If LST < threshold, assign category 1 (normal); otherwise, assign category 2 (healland)
+     {
+       'threshold': cutmark,
+       'LST': 'LST' // Replace 'LST' with the actual band name of your LST raster image
+     });
+      
+        // Clip the median LST to the ROI
+        var cliped = cls.clip(roi); 
+        
+    // Visualize parameters
+     var visu = Map.addLayer(cliped, {min: 1, max: 2, palette: ['green', 'red' ]});
+      
+        return cliped
+      }
+
+      // Function to calculate area of categories in a raster image
+function AreaCal(raster, categoryValues, roi) {
+    // Define an empty list to store results
+    var results = [];
+    
+    // Get the image bounding box
+    var bounds = raster.geometry().bounds();
+    
+    // Loop through each category
+    for (var i = 0; i < categoryValues.length; i++) {
+      // Define the region corresponding to the category
+      var category = raster.eq(categoryValues[i]);
+      
+      // Calculate the area of the category in square meters
+      var area = category.multiply(ee.Image.pixelArea()).rename('Area_' + categoryValues[i]);
+      
+      // Convert the area from square meters to hectares
+      var area_hectares = area.divide(1000000); // 1 sq km = 10,00,000 square meters
+      
+      // Get statistics of the area for the category
+      var stats_area = area.reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: roi, // Use the bounding box
+        scale: 30,
+        maxPixels: 1e13
+      });
+      
+      // Add the result to the results list
+      results.push(stats_area.get('Area_' + categoryValues[i]));
+    }
+    
+    // Return the results
+    return results;
+  }
+// Define the ID of the image you want to remove
+var I89 = "LT05_136043_19891129"; // Replace with the ID of the image you want to remove
+var I01 = "LT05_136043_20010130"; // Replace with the ID of the image you want to remove
+
+//.filter(ee.Filter.neq('system:index', I89));
+
+// Load an image collection from Landsat 5.
+var LT88 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1988-01-01','1988-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT89 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1989-01-01','1989-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.filter(ee.Filter.neq('system:index', I89))
+.map(scaling)
+.map(cloudMask);
+
+var LT90 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1990-01-01','1990-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT91 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1991-01-01','1991-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT92 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1992-01-01','1992-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT93 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1993-01-01','1993-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT94 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1994-01-01','1994-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT95 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1995-01-01','1995-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT96 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1996-01-01','1996-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT97 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1997-01-01','1997-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT98 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1998-01-01','1998-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT99 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('1999-01-01','1999-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT00 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2000-01-01','2000-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT01 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2001-01-01','2001-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.filter(ee.Filter.neq('system:index', I01))
+.map(scaling)
+.map(cloudMask);
+
+var LT03 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2003-01-01','2003-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT04 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2004-01-01','2004-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT05 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2005-01-01','2005-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT06 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2006-01-01','2006-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT07 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2007-01-01','2007-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT08 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2008-01-01','2008-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT09 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2009-01-01','2009-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT10 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2010-01-01','2010-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT11 = ee.ImageCollection("LANDSAT/LT05/C02/T1_L2")
+.filterDate('2011-01-01','2011-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+// Load an image collection from Landsat 7.
+var LT02 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2") 
+.filterDate('2002-01-01','2002-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT12 = ee.ImageCollection("LANDSAT/LE07/C02/T1_L2") 
+.filterDate('2012-01-01','2012-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+// Load an image collection from Landsat 8.
+var LT13 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2013-01-01','2013-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT14 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2014-01-01','2014-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT15 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2015-01-01','2015-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT16 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2016-01-01','2016-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT17 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2017-01-01','2017-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT18 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2018-01-01','2018-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT19 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2019-01-01','2019-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT20 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2020-01-01','2020-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT21 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2021-01-01','2021-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT22 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2022-01-01','2022-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT23 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2023-01-01','2023-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+var LT24 = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+.filterDate('2024-01-01','2024-12-31')
+.filterBounds(ROI)
+.filter(ee.Filter.lte('CLOUD_COVER', Cloud))
+.map(scaling)
+.map(cloudMask);
+
+
+
+var LST1988 = LST(LT88, ROI, TM);
+var LST1989 = LST(LT89, ROI, TM);
+var LST1990 = LST(LT90, ROI, TM);
+var LST1991 = LST(LT91, ROI, TM);
+var LST1992 = LST(LT92, ROI, TM);
+var LST1993 = LST(LT93, ROI, TM);
+var LST1994 = LST(LT94, ROI, TM);
+var LST1995 = LST(LT95, ROI, TM);
+var LST1996 = LST(LT96, ROI, TM);
+var LST1997 = LST(LT97, ROI, TM);
+var LST1998 = LST(LT98, ROI, TM);
+var LST1999 = LST(LT99, ROI, TM);
+var LST2000 = LST(LT00, ROI, TM);
+var LST2001 = LST(LT01, ROI, TM);
+var LST2002 = LST(LT02, ROI, TM);
+var LST2003 = LST(LT03, ROI, TM);
+var LST2004 = LST(LT04, ROI, TM);
+var LST2005 = LST(LT05, ROI, TM);
+var LST2006 = LST(LT06, ROI, TM);
+var LST2007 = LST(LT07, ROI, TM);
+var LST2008 = LST(LT08, ROI, TM);
+var LST2009 = LST(LT09, ROI, TM);
+var LST2010 = LST(LT10, ROI, TM);
+var LST2011 = LST(LT11, ROI, TM);
+var LST2012 = LST(LT12, ROI, TM);
+var LST2013 = LST(LT13, ROI, OLI);
+var LST2014 = LST(LT14, ROI, OLI);
+var LST2015 = LST(LT15, ROI, OLI);
+var LST2016 = LST(LT16, ROI, OLI);
+var LST2017 = LST(LT17, ROI, OLI);
+var LST2018 = LST(LT18, ROI, OLI);
+var LST2019 = LST(LT19, ROI, OLI);
+var LST2020 = LST(LT20, ROI, OLI);
+var LST2021 = LST(LT21, ROI, OLI);
+var LST2022 = LST(LT22, ROI, OLI);
+var LST2023 = LST(LT23, ROI, OLI);
+var LST2024 = LST(LT24, ROI, OLI);
+
+
+
+var U1988 = UTFVI(LST1988, ROI, 'U1988');
+var U1989 = UTFVI(LST1989, ROI, 'U1989');
+var U1990 = UTFVI(LST1990, ROI, 'U1990');
+var U1991 = UTFVI(LST1991, ROI, 'U1991');
+var U1992 = UTFVI(LST1992, ROI, 'U1992');
+var U1993 = UTFVI(LST1993, ROI, 'U1993');
+var U1994 = UTFVI(LST1994, ROI, 'U1994');
+var U1995 = UTFVI(LST1995, ROI, 'U1995');
+var U1996 = UTFVI(LST1996, ROI, 'U1996');
+var U1997 = UTFVI(LST1997, ROI, 'U1997');
+var U1998 = UTFVI(LST1998, ROI, 'U1998');
+var U1999 = UTFVI(LST1999, ROI, 'U1999');
+var U2000 = UTFVI(LST2000, ROI, 'U2000');
+var U2001 = UTFVI(LST2001, ROI, 'U2001');
+var U2002 = UTFVI(LST2002, ROI, 'U2002');
+var U2003 = UTFVI(LST2003, ROI, 'U2003');
+var U2004 = UTFVI(LST2004, ROI, 'U2004');
+var U2005 = UTFVI(LST2005, ROI, 'U2005');
+var U2006 = UTFVI(LST2006, ROI, 'U2006');
+var U2007 = UTFVI(LST2007, ROI, 'U2007');
+var U2008 = UTFVI(LST2008, ROI, 'U2008');
+var U2009 = UTFVI(LST2009, ROI, 'U2009');
+var U2010 = UTFVI(LST2010, ROI, 'U2010');
+var U2011 = UTFVI(LST2011, ROI, 'U2011');
+var U2012 = UTFVI(LST2012, ROI, 'U2012');
+var U2013 = UTFVI(LST2013, ROI, 'U2013');
+var U2014 = UTFVI(LST2014, ROI, 'U2014');
+var U2015 = UTFVI(LST2015, ROI, 'U2015');
+var U2016 = UTFVI(LST2016, ROI, 'U2016');
+var U2017 = UTFVI(LST2017, ROI, 'U2017');
+var U2018 = UTFVI(LST2018, ROI, 'U2018');
+var U2019 = UTFVI(LST2019, ROI, 'U2019');
+var U2020 = UTFVI(LST2020, ROI, 'U2020');
+var U2021 = UTFVI(LST2021, ROI, 'U2021');
+var U2022 = UTFVI(LST2022, ROI, 'U2022');
+var U2023 = UTFVI(LST2023, ROI, 'U2023');
+var U2024 = UTFVI(LST2024, ROI, 'U2024');
+
+
+var h1988 = Island(LST1988, ROI);
+var h1989 = Island(LST1989, ROI);
+var h1990 = Island(LST1990, ROI);
+var h1991 = Island(LST1991, ROI);
+var h1992 = Island(LST1992, ROI);
+var h1993 = Island(LST1993, ROI);
+var h1994 = Island(LST1994, ROI);
+var h1995 = Island(LST1995, ROI);
+var h1996 = Island(LST1996, ROI);
+var h1997 = Island(LST1997, ROI);
+var h1998 = Island(LST1998, ROI);
+var h1999 = Island(LST1999, ROI);
+var h2000 = Island(LST2000, ROI);
+var h2001 = Island(LST2001, ROI);
+var h2002 = Island(LST2002, ROI);
+var h2003 = Island(LST2003, ROI);
+var h2004 = Island(LST2004, ROI);
+var h2005 = Island(LST2005, ROI);
+var h2006 = Island(LST2006, ROI);
+var h2007 = Island(LST2007, ROI);
+var h2008 = Island(LST2008, ROI);
+var h2009 = Island(LST2009, ROI);
+var h2010 = Island(LST2010, ROI);
+var h2011 = Island(LST2011, ROI);
+var h2012 = Island(LST2012, ROI);
+var h2013 = Island(LST2013, ROI);
+var h2014 = Island(LST2014, ROI);
+var h2015 = Island(LST2015, ROI);
+var h2016 = Island(LST2016, ROI);
+var h2017 = Island(LST2017, ROI);
+var h2018 = Island(LST2018, ROI);
+var h2019 = Island(LST2019, ROI);
+var h2020 = Island(LST2020, ROI);
+var h2021 = Island(LST2021, ROI);
+var h2022 = Island(LST2022, ROI);
+var h2023 = Island(LST2023, ROI);
+var h2024 = Island(LST2024, ROI);
+var d= h2024.bandNames(); 
+print(d);
+
+var HC = [1, 2];
+
+var HI1988 = AreaCal(h1988,HC,ROI);
+var HI1989 = AreaCal(h1989,HC,ROI);
+var HI1990 = AreaCal(h1990,HC,ROI);
+var HI1991 = AreaCal(h1991,HC,ROI);
+var HI1992 = AreaCal(h1992,HC,ROI);
+var HI1993 = AreaCal(h1993,HC,ROI);
+var HI1994 = AreaCal(h1994,HC,ROI);
+var HI1995 = AreaCal(h1995,HC,ROI);
+var HI1996 = AreaCal(h1996,HC,ROI);
+var HI1997 = AreaCal(h1997,HC,ROI);
+var HI1998 = AreaCal(h1998,HC,ROI);
+var HI1999 = AreaCal(h1999,HC,ROI);
+var HI2000 = AreaCal(h2000,HC,ROI);
+var HI2001 = AreaCal(h2001,HC,ROI);
+var HI2002 = AreaCal(h2002,HC,ROI);
+var HI2003 = AreaCal(h2003,HC,ROI);
+var HI2004 = AreaCal(h2004,HC,ROI);
+var HI2005 = AreaCal(h2005,HC,ROI);
+var HI2006 = AreaCal(h2006,HC,ROI);
+var HI2007 = AreaCal(h2007,HC,ROI);
+var HI2008 = AreaCal(h2008,HC,ROI);
+var HI2009 = AreaCal(h2009,HC,ROI);
+var HI2010 = AreaCal(h2010,HC,ROI);
+var HI2011 = AreaCal(h2011,HC,ROI);
+var HI2012 = AreaCal(h2012,HC,ROI);
+var HI2013 = AreaCal(h2013,HC,ROI);
+var HI2014 = AreaCal(h2014,HC,ROI);
+var HI2015 = AreaCal(h2015,HC,ROI);
+var HI2016 = AreaCal(h2016,HC,ROI);
+var HI2017 = AreaCal(h2017,HC,ROI);
+var HI2018 = AreaCal(h2018,HC,ROI);
+var HI2019 = AreaCal(h2019,HC,ROI);
+var HI2020 = AreaCal(h2020,HC,ROI);
+var HI2021 = AreaCal(h2021,HC,ROI);
+var HI2022 = AreaCal(h2022,HC,ROI);
+var HI2023 = AreaCal(h2023,HC,ROI);
+var HI2024 = AreaCal(h2024,HC,ROI);
+
+
+var heatisland = ee.List([HI1988,HI1989, HI1990, HI1991,HI1992,HI1993,HI1994,HI1995,HI1996,HI1997,HI1998,HI1999,HI2000,HI2001,HI2002,HI2003,HI2004,HI2005,HI2006,HI2007,HI2008,HI2009,HI2010,HI2011,HI2012,HI2013,HI2014,HI2015,HI2016,HI2017,HI2018,HI2019,HI2020,HI2021,HI2022,HI2023,HI2024]);
+
+// Create a FeatureCollection from the combined list
+var HeatCollection = ee.FeatureCollection(heatisland.map(function(list) {
+  return ee.Feature(null, {'data': list});
+}));
+
+// Export the FeatureCollection.
+Export.table.toDrive({
+  collection: HeatCollection,
+  description: 'Heat Island',
+  fileFormat: 'CSV'
+});
+
+
+var UC = [1, 2, 3, 4, 5, 6];
+
+var UM1988 = AreaCal(U1988,UC,ROI);
+var UM1989 = AreaCal(U1989,UC,ROI);
+var UM1990 = AreaCal(U1990,UC,ROI);
+var UM1991 = AreaCal(U1991,UC,ROI);
+var UM1992 = AreaCal(U1992,UC,ROI);
+var UM1993 = AreaCal(U1993,UC,ROI);
+var UM1994 = AreaCal(U1994,UC,ROI);
+var UM1995 = AreaCal(U1995,UC,ROI);
+var UM1996 = AreaCal(U1996,UC,ROI);
+var UM1997 = AreaCal(U1997,UC,ROI);
+var UM1998 = AreaCal(U1998,UC,ROI);
+var UM1999 = AreaCal(U1999,UC,ROI);
+var UM2000 = AreaCal(U2000,UC,ROI);
+var UM2001 = AreaCal(U2001,UC,ROI);
+var UM2002 = AreaCal(U2002,UC,ROI);
+var UM2003 = AreaCal(U2003,UC,ROI);
+var UM2004 = AreaCal(U2004,UC,ROI);
+var UM2005 = AreaCal(U2005,UC,ROI);
+var UM2006 = AreaCal(U2006,UC,ROI);
+var UM2007 = AreaCal(U2007,UC,ROI);
+var UM2008 = AreaCal(U2008,UC,ROI);
+var UM2009 = AreaCal(U2009,UC,ROI);
+var UM2010 = AreaCal(U2010,UC,ROI);
+var UM2011 = AreaCal(U2011,UC,ROI);
+var UM2012 = AreaCal(U2012,UC,ROI);
+var UM2013 = AreaCal(U2013,UC,ROI);
+var UM2014 = AreaCal(U2014,UC,ROI);
+var UM2015 = AreaCal(U2015,UC,ROI);
+var UM2016 = AreaCal(U2016,UC,ROI);
+var UM2017 = AreaCal(U2017,UC,ROI);
+var UM2018 = AreaCal(U2018,UC,ROI);
+var UM2019 = AreaCal(U2019,UC,ROI);
+var UM2020 = AreaCal(U2020,UC,ROI);
+var UM2021 = AreaCal(U2021,UC,ROI);
+var UM2022 = AreaCal(U2022,UC,ROI);
+var UM2023 = AreaCal(U2023,UC,ROI);
+var UM2024 = AreaCal(U2024,UC,ROI);
+
+
+var UKM = ee.List([UM1988,UM1989, UM1990, UM1991,UM1992,UM1993,UM1994,UM1995,UM1996,UM1997,UM1998,UM1999,UM2000,UM2001,UM2002,UM2003,UM2004,UM2005,UM2006,UM2007,UM2008,UM2009,UM2010,UM2011,UM2012,UM2013,UM2014,UM2015,UM2016,UM2017,UM2018,UM2019,UM2020,UM2021,UM2022,UM2023,UM2024]);
+
+// Create a FeatureCollection from the combined list
+var UTFVICollection = ee.FeatureCollection(UKM.map(function(list) {
+  return ee.Feature(null, {'data': list});
+}));
+
+// Export the FeatureCollection.
+Export.table.toDrive({
+  collection: UTFVICollection,
+  description: 'UTFVI',
+  fileFormat: 'CSV'
+});
+
+
+// Define your image collection
+var collection = ee.ImageCollection([]);
+
+// List of variable names for your images
+var imageVariables = [
+  U1999, U2000, U2001, U2002, U2003, U2004, U2005, U2006, U2007
+  // Add all your image variable names here...
+];
+
+// Function to add images to the collection
+var addImagesToCollection = function(imageVar, prevCollection) {
+  var image = ee.Image(imageVar);
+  return ee.ImageCollection(prevCollection).merge(ee.ImageCollection([image]));
+};
+
+// Add each image to the collection
+for (var i = 0; i < imageVariables.length; i++) {
+  collection = addImagesToCollection(imageVariables[i], collection);
+}
+
+
+// Define a visualization function to create false color composite
+var visualize = function(image) {
+  var falseColor = image.visualize({
+    bands: ['constant','constant','constant'],
+    min: 0,
+    max: 255
+  });
+  return falseColor;
+};
+
+// Generate image collection with false color composites
+var animationFrames = collection.map(visualize);
+
+
+
+
+
+// Print the collection to check
+print(collection);
+// Export the animation as a GIF
+Export.video.toDrive({
+  collection: animationFrames,
+  description: "animation",
+  dimensions: 720,
+  framesPerSecond: 2
+});
